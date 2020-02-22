@@ -85,13 +85,21 @@ impl AnyVec {
         self.vtable.assert_typecheck::<T>();
     }
 
+    unsafe fn typed<T: Any>(&self) -> std::mem::ManuallyDrop<Vec<T>> {
+        std::mem::ManuallyDrop::new(Vec::from_raw_parts(
+            self.data as *mut T,
+            self.length,
+            self.capacity,
+        ))
+    }
+
     fn into_vec<T: Any>(self) -> Vec<T> {
         self.assert_typecheck::<T>();
-        let moved = unsafe { Vec::from_raw_parts(self.data as *mut T, self.length, self.capacity) };
-        // We've transferred ownership of the memory we own into ``moved``, so
+        let moved = unsafe { self.typed() };
+        // We're transferring ownership of the memory we own into ``moved``, so
         // don't run our destructor.
         mem::forget(self);
-        moved
+        std::mem::ManuallyDrop::into_inner(moved)
     }
 
     fn with_vec<'a, T: Any, F, R>(&'a self, f: F) -> R
@@ -102,8 +110,8 @@ impl AnyVec {
 
         unsafe {
             // Temporarily materialize a vector and pass it through to ``f``,
-            let vec = Vec::from_raw_parts(self.data as *mut T, self.length, self.capacity);
-            let vec_ptr = &vec as *const Vec<T>;
+            let vec = self.typed::<T>();
+            let vec_ptr = &*vec as *const Vec<T>;
             let result: R = f(&*vec_ptr);
             mem::forget(vec);
             result
@@ -117,10 +125,13 @@ impl AnyVec {
         self.assert_typecheck::<T>();
 
         let (result, (data, length, capacity)) = unsafe {
-            let mut vec = Vec::from_raw_parts(self.data as *mut T, self.length, self.capacity);
-            let vec_ptr = &mut vec as *mut Vec<T>;
+            let mut vec = self.typed::<T>();
+            let vec_ptr = &mut *vec as *mut Vec<T>;
             let result: R = f(&mut *vec_ptr);
-            (result, vec.into_raw_parts())
+            (
+                result,
+                std::mem::ManuallyDrop::into_inner(vec).into_raw_parts(),
+            )
         };
 
         self.data = data as *mut u8;
@@ -140,10 +151,11 @@ impl AnyVec {
         }
 
         // See Vec::truncate impl.
+        let ndropped: usize = self.length - length;
         self.length = length;
         (self.vtable.drop_slice)(
             unsafe { self.data.add(length * self.vtable.size) },
-            length - self.length,
+            ndropped,
         );
     }
 
@@ -291,6 +303,45 @@ mod tests {
         let result: Vec<i64> = chan.borrow().clone();
         let expected = vec![1, 2, 3];
 
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_truncate() {
+        let chan: Rc<RefCell<Vec<i64>>> = Rc::new(RefCell::new(vec![]));
+        let mut dynamic = AnyVec::from_vec(vec![
+            HasDrop {
+                id: 1,
+                chan: chan.clone(),
+            },
+            HasDrop {
+                id: 2,
+                chan: chan.clone(),
+            },
+            HasDrop {
+                id: 3,
+                chan: chan.clone(),
+            },
+        ]);
+
+        dynamic.truncate(2);
+        let result: Vec<i64> = chan.borrow().clone();
+        let expected = vec![3];
+        assert_eq!(result, expected);
+
+        dynamic.truncate(1);
+        let result: Vec<i64> = chan.borrow().clone();
+        let expected = vec![3, 2];
+        assert_eq!(result, expected);
+
+        dynamic.truncate(0);
+        let result: Vec<i64> = chan.borrow().clone();
+        let expected = vec![3, 2, 1];
+        assert_eq!(result, expected);
+
+        dynamic.truncate(3);
+        let result: Vec<i64> = chan.borrow().clone();
+        let expected = vec![3, 2, 1];
         assert_eq!(result, expected);
     }
 
