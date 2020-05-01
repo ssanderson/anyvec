@@ -1,4 +1,7 @@
 #![feature(vec_into_raw_parts)]
+#![feature(const_fn)]
+#![feature(const_type_id)]
+#![feature(const_type_name)]
 
 use std::mem;
 
@@ -19,7 +22,7 @@ mod vtable {
     }
 
     impl VTable {
-        pub fn new<T: Any + Clone + PartialEq>() -> VTable {
+        pub const fn new<T: Any + Clone + PartialEq>() -> VTable {
             VTable {
                 id: TypeId::of::<T>(),
                 display_name: type_name::<T>(),
@@ -83,11 +86,9 @@ mod vtable {
         capacity: usize,
     ) -> (*mut u8, usize, usize) {
         let mut v = Vec::from_raw_parts(data as *mut T, length, capacity);
-        println!("before newsize={} length={} cap={}", newsize, length, capacity);
         v.reserve(newsize);
 
         let (new_data, new_length, new_capacity) = v.into_raw_parts();
-        println!("{} {}", new_length, new_capacity);
         (new_data as *mut u8, new_length, new_capacity)
     }
 
@@ -99,25 +100,33 @@ mod vtable {
         let s: &mut [T] = std::slice::from_raw_parts_mut(data as *mut T, length);
         std::ptr::drop_in_place(s);
     }
+
+    pub trait StaticVTable {
+        const VTABLE: VTable;
+    }
+
+    impl<T> StaticVTable for T
+    where
+        T: Any + Clone + PartialEq + 'static,
+    {
+        const VTABLE: VTable = VTable::new::<T>();
+    }
 }
 
-use vtable::VTable;
+use vtable::{StaticVTable, VTable};
 
 #[derive(Clone)]
 pub struct AnyRef<'a> {
     data: *const u8,
-    // TODO: Make this a static ref.
-    vtable: VTable,
-    phantom: std::marker::PhantomData<&'a u8>,
+    vtable: &'static VTable,
+    phantom: std::marker::PhantomData<&'a [u8]>,
 }
 
 impl<'a> AnyRef<'a> {
-    fn new<T: Any + Clone + PartialEq>(val: &'a T) -> AnyRef<'a> {
-        let data: *const u8 = val as *const T as *const u8;
-        let vtable = VTable::new::<T>();
+    fn new<T: StaticVTable>(val: &'a T) -> AnyRef<'a> {
         AnyRef {
-            data,
-            vtable,
+            data: val as *const T as *const u8,
+            vtable: &T::VTABLE,
             phantom: std::marker::PhantomData,
         }
     }
@@ -126,6 +135,16 @@ impl<'a> AnyRef<'a> {
 impl std::fmt::Debug for AnyRef<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "AnyRef")
+    }
+}
+
+impl<T: StaticVTable> PartialEq<&T> for AnyRef<'_> {
+    fn eq(&self, other: &&T) -> bool {
+        if self.vtable != &T::VTABLE {
+            return false;
+        }
+        let addr: *const u8 = *other as *const T as *const u8;
+        unsafe { (self.vtable.eq)(self.data, addr) }
     }
 }
 
@@ -142,7 +161,7 @@ pub struct AnyVec {
     data: *mut u8,
     length: usize,
     capacity: usize,
-    vtable: VTable,
+    vtable: &'static VTable,
 }
 
 use std::any::Any;
@@ -152,13 +171,13 @@ impl AnyVec {
         AnyVec::from_vec(Vec::<T>::new())
     }
 
-    pub fn from_vec<T: Any + Clone + PartialEq>(vec: Vec<T>) -> AnyVec {
+    pub fn from_vec<T: StaticVTable>(vec: Vec<T>) -> AnyVec {
         let (data, length, capacity) = vec.into_raw_parts();
         AnyVec {
             data: data as *mut u8,
             length,
             capacity,
-            vtable: VTable::new::<T>(),
+            vtable: &T::VTABLE,
         }
     }
 
@@ -191,10 +210,8 @@ impl AnyVec {
     }
 
     fn reserve(&mut self, size: usize) {
-        println!("data={:?} length={} cap={}", self.data, self.length, self.capacity);
         let (data, length, capacity) =
             unsafe { (self.vtable.reserve)(size, self.data, self.length, self.capacity) };
-        println!("data={:?} length={} cap={}", data, length, capacity);
         self.data = data;
         self.length = length;
         self.capacity = capacity;
@@ -244,7 +261,7 @@ impl AnyVec {
         let addr = self.at(index);
         return Some(AnyRef {
             data: addr,
-            vtable: self.vtable.clone(),
+            vtable: self.vtable,
             phantom: std::marker::PhantomData,
         });
     }
@@ -253,10 +270,9 @@ impl AnyVec {
         self.get(0)
     }
 
-    pub fn first_mut<'a>(&'a mut self) -> Option<AnyRef<'a>> {
-        unimplemented!();
-    }
-
+    // pub fn first_mut<'a>(&'a mut self) -> Option<AnyMutRef<'a>> {
+    //     unimplemented!();
+    // }
     // End Vec API
 }
 
@@ -269,6 +285,29 @@ impl Drop for AnyVec {
 #[cfg(test)]
 mod tests {
     use super::{AnyRef, AnyVec};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    // A struct that appends its id into a shared vector when it's dropped.
+    // This is useful for testing that values of this type get dropped when
+    // they should.
+    #[derive(Clone)]
+    struct HasDrop {
+        id: i64,
+        chan: std::rc::Rc<std::cell::RefCell<Vec<i64>>>,
+    }
+
+    impl PartialEq for HasDrop {
+        fn eq(&self, other: &Self) -> bool {
+            self.id == other.id
+        }
+    }
+
+    impl Drop for HasDrop {
+        fn drop(&mut self) {
+            self.chan.borrow_mut().push(self.id);
+        }
+    }
 
     #[test]
     fn test_push_u64() {
@@ -316,6 +355,8 @@ mod tests {
     #[test]
     fn test_get() {
         let dynamic: AnyVec = AnyVec::from_vec::<u64>(vec![3, 4, 5]);
+        let value = dynamic.get(0);
+        assert_eq!(value, Some(AnyRef::new(&(3 as u64))));
 
         for i in 0..3 {
             let expected_value: u64 = i + 3;
@@ -337,6 +378,13 @@ mod tests {
         assert_eq!(result, Some(AnyRef::new(&expected)));
     }
 
+    #[test]
+    fn test_compare_ref_to_value() {
+        let val: f64 = 3.5;
+        let dynval = AnyRef::new(&val);
+        assert_eq!(dynval, &val);
+    }
+
     // #[test]
     // fn test_first_mut() {
     //     let mut dynamic: AnyVec = AnyVec::from_vec::<u64>(vec![3, 4, 5]);
@@ -355,81 +403,67 @@ mod tests {
     //     assert_eq!(typed, vec![100, 4, 5]);
     // }
 
-    // #[test]
-    // fn test_drop_vec() {
-    //     let chan: Rc<RefCell<Vec<i64>>> = Rc::new(RefCell::new(vec![]));
-    //     let dynamic = AnyVec::from_vec(vec![
-    //         HasDrop {
-    //             id: 1,
-    //             chan: chan.clone(),
-    //         },
-    //         HasDrop {
-    //             id: 2,
-    //             chan: chan.clone(),
-    //         },
-    //         HasDrop {
-    //             id: 3,
-    //             chan: chan.clone(),
-    //         },
-    //     ]);
-    //     std::mem::drop(dynamic);
+    #[test]
+    fn test_drop_vec() {
+        let chan: Rc<RefCell<Vec<i64>>> = Rc::new(RefCell::new(vec![]));
+        let dynamic = AnyVec::from_vec(vec![
+            HasDrop {
+                id: 1,
+                chan: chan.clone(),
+            },
+            HasDrop {
+                id: 2,
+                chan: chan.clone(),
+            },
+            HasDrop {
+                id: 3,
+                chan: chan.clone(),
+            },
+        ]);
+        std::mem::drop(dynamic);
 
-    //     let result: Vec<i64> = chan.borrow().clone();
-    //     let expected = vec![1, 2, 3];
+        let result: Vec<i64> = chan.borrow().clone();
+        let expected = vec![1, 2, 3];
 
-    //     assert_eq!(result, expected);
-    // }
+        assert_eq!(result, expected);
+    }
 
-    // #[test]
-    // fn test_truncate() {
-    //     let chan: Rc<RefCell<Vec<i64>>> = Rc::new(RefCell::new(vec![]));
-    //     let mut dynamic = AnyVec::from_vec(vec![
-    //         HasDrop {
-    //             id: 1,
-    //             chan: chan.clone(),
-    //         },
-    //         HasDrop {
-    //             id: 2,
-    //             chan: chan.clone(),
-    //         },
-    //         HasDrop {
-    //             id: 3,
-    //             chan: chan.clone(),
-    //         },
-    //     ]);
+    #[test]
+    fn test_truncate() {
+        let chan: Rc<RefCell<Vec<i64>>> = Rc::new(RefCell::new(vec![]));
+        let mut dynamic = AnyVec::from_vec(vec![
+            HasDrop {
+                id: 1,
+                chan: chan.clone(),
+            },
+            HasDrop {
+                id: 2,
+                chan: chan.clone(),
+            },
+            HasDrop {
+                id: 3,
+                chan: chan.clone(),
+            },
+        ]);
 
-    //     dynamic.truncate(2);
-    //     let result: Vec<i64> = chan.borrow().clone();
-    //     let expected = vec![3];
-    //     assert_eq!(result, expected);
+        dynamic.truncate(2);
+        let result: Vec<i64> = chan.borrow().clone();
+        let expected = vec![3];
+        assert_eq!(result, expected);
 
-    //     dynamic.truncate(1);
-    //     let result: Vec<i64> = chan.borrow().clone();
-    //     let expected = vec![3, 2];
-    //     assert_eq!(result, expected);
+        dynamic.truncate(1);
+        let result: Vec<i64> = chan.borrow().clone();
+        let expected = vec![3, 2];
+        assert_eq!(result, expected);
 
-    //     dynamic.truncate(0);
-    //     let result: Vec<i64> = chan.borrow().clone();
-    //     let expected = vec![3, 2, 1];
-    //     assert_eq!(result, expected);
+        dynamic.truncate(0);
+        let result: Vec<i64> = chan.borrow().clone();
+        let expected = vec![3, 2, 1];
+        assert_eq!(result, expected);
 
-    //     dynamic.truncate(3);
-    //     let result: Vec<i64> = chan.borrow().clone();
-    //     let expected = vec![3, 2, 1];
-    //     assert_eq!(result, expected);
-    // }
-
-    // // A struct that appends its id into a shared vector when it's dropped.
-    // // This is useful for testing that values of this type get dropped when
-    // // they should.
-    // struct HasDrop {
-    //     id: i64,
-    //     chan: std::rc::Rc<std::cell::RefCell<Vec<i64>>>,
-    // }
-
-    // impl Drop for HasDrop {
-    //     fn drop(&mut self) {
-    //         self.chan.borrow_mut().push(self.id);
-    //     }
-    // }
+        dynamic.truncate(3);
+        let result: Vec<i64> = chan.borrow().clone();
+        let expected = vec![3, 2, 1];
+        assert_eq!(result, expected);
+    }
 }
